@@ -1,0 +1,674 @@
+/*
+	The PDF documents about understanding Linux Kernel 1.2 are made by Liu Yihao
+	这份学习Linux内核的PDF文档由刘以浩同学整理完成
+	包含了作者在学习内核过程中搜集到的大量有关Linux
+	内核的知识和自己的一些理解以及注释
+	当然，最宝贵的还是这份原生的内核代码
+	NOTE：如果在阅读过程中遇到什么问题，欢迎和我交流讨论
+	Email：liuyihaolovem@163.com
+*/
+!
+! SYS_SIZE is the number of clicks (16 bytes) to be loaded.
+! 0x7F00 is 0x7F000 bytes = 508kB, more than enough for current
+! versions of linux which compress the kernel
+!
+#include <linux/config.h>
+SYSSIZE = DEF_SYSSIZE
+!
+!	bootsect.s		Copyright (C) 1991, 1992 Linus Torvalds
+!	modified by Drew Eckhardt
+!	modified by Bruce Evans (bde)
+/*
+开机自检
+ 在刚开机时，根据X386CUP的特性，代码段（CS，CODE SEGMENT）寄存器的值为全1，指令
+计数器（IP,INSTRUCTION POINTER）的值为全0，既CS=FFFF、IP=0000。这时CPU根据
+CS和IP 的值执行FFFF0H处的指令。由于FFFF0H已经到了基本内存的高地址顶端，所以，
+FFFF0H处的指令一般总是一个JMP指令，以便CPU能够跳到比较低的地址去执行那里的代码，
+这个地址通常是ROM BIOS 的入口地址。接着，ROM BIOS 进行开机自检，如检查内存，
+键盘等。在自检过程中，ROM BIOS会在上位内存（UMB，UPPERMEMORY BLOCK）中进行扫描，
+看看是否存在合法的设备控制卡ROM BIOS（如:SCSI卡上的ROM），如果有，就执行其中的一些
+初始化代码。最后，ROM BIOS 读取磁盘上的第一个扇区并将这个扇区的内存装入内存。
+*/
+!一般PC在电源一开时，是由内存中地址FFFF:0000开始执行(这个地址一定在ROMBIOS中，
+!ROMBIOS一般是在FEOOOh到FFFFFh中)，而此处的内容则是一个jump指令，jump到另  
+!一个位于ROMBIOS中的位置，开始执行一系列的动作，包括了检查RAM，keyboard，显示  
+!器，软硬磁盘等等，这些动作是由系统测试码(systemtestcode)来执行的，随着制作BI  
+!OS厂商的不同而会有些许差异，但都是大同小异
+!紧接着系统测试码之后，控制权会转移给ROM中的启动程序(ROMbootstraproutine) ，
+!这个程序会将可启动设备上的零道零扇区读入内存中(这就是一般所谓的bootsector)，至于被读
+!到内存的哪里呢?--绝对位置07C0:0000(即07C00h处)，这是IBM系列PC的特性。而位在
+!linux开机磁盘的bootsector上的正是linux的bootsect程序，也就是说，bootsect
+!是第一个被读入内存中并执行的程序。然后，bootsect将它"自己"从被ROMBIOS载入的绝
+！对地址0x7C00处搬到0x90000处，  然后利用一个jmpi(jumpindirectly)的指令，
+！跳到新位置的jmpi的下一行去执行
+/*
+在“arch/i386/boot”目录下，bootsect.S是生成引导扇区的汇编源码，它首先将自己拷贝到
+0x90000上，然后将紧接其后的setup部分（第二扇区）拷贝到0x90200，将真正的内核代码拷
+贝到0x10000。以上这些拷贝动作都是以bootsect.S、setup.S以及vmlinux在磁盘上连续
+存放为前提的，也就是说，我们的bzImage文件或者zImage文件是按照bootsect，setup， 
+vmlinux这样的顺序组织，并存放于始于引导分区的首扇区的连续磁盘扇区之中
+*/
+/*
+整个内核生成流程是这样的：
+1、编译生成未压缩内核vmlinux
+2、./xtract把vmlinux去掉头部。
+3、gzip -9 对vmlinux进行压缩
+4、piggyback给压缩的内核加上头部和符号表输出为a.out格式的目标文件piggy.o，只包含了1个数据段(压缩的内核)和符号表，
+符号表输出input_data和input_len(见piggyback.c的代码)，这两个符号被解压辅助程序misc.c中的fill_inbuf()函数使用(获取压缩数据补充到缓冲区)。
+5、compressed/head.o,compressed/inflate.o,compressed/unzip.o,compressed/misc.o,compressed/piggy.o连接为compressed/vmlinux
+6、使用tools/build把bootsect、setup、compressed/vmlinux(去掉头部)连接为zImage
+纯正的linux1.2.13引导过程：
+1、计算机自举将磁盘上的0道0头1扇区上的bootsect读入007c:0000,它将自身移动到9000:0000,临时堆栈设置为9000:0x4000-12
+2、读入setup扇区到9000:0200开始处，屏幕显示Loading，把自解压内核读入0x10000处，跳转到9000:0200处运行（setup的代码）
+3、setup进行一些设置(内存、键盘、中断控制器、vga、A20线等)，把内核移动到0x1000处，并开启保护模式，跳转到0000:1000处执行
+4、0000:1000处是compressed/head.S的代码,它首先将堆栈设置到user_stack[]数组尾端，然后检查A20是否开启，BSS段清零，调用
+decompress_kernel()进行内核解压，解压后的内核位于内存0x100000处，解压返回后跳转到0x100000处运行内核代码(arch/i386/head.S的
+startup_32处)
+5、head开始也是清BSS段，然后调用setup_idt设置idt，检查cpu类型，开启分页机制，重新装载gdt和idt,
+设置堆栈指向init_user_stack[]数组末端，跳转到linux/init/main.c的start_kernel()运行。
+流程：start_kernel()->init()，然后调用execve运行init程序。
+*/
+
+//linux/arch/i386/boot/boot	sect.S, is loaded by BIOS to 07C0:0. The 
+//reset of bzImage (bsetupand bvmlinux) has not been loaded yet.
+
+！ 0x7c00==31KB 0x90000==576KB
+
+! bootsect.s is loaded at 0x7c00 by the bios-startup routines, and moves
+! itself out of the way to address 0x90000, and jumps there.
+//bde - 不能盲目地跳转，有些系统可能只有512k的低
+///内存。使用中断0x12来获得(系统的)最高内存、等等 
+! bde - should not jump blindly, there may be systems with only 512K low
+! memory.  Use int 0x12 to get the top of memory, etc.
+!
+! It then loads 'setup' directly after itself (0x90200), and the system
+! at 0x10000, using BIOS interrupts. 
+!
+! NOTE! currently system is at most (8*65536-4096) bytes long. This should 
+! be no problem, even in the future. I want to keep it simple. This 508 kB
+! kernel size should be enough, especially as this doesn't contain the
+! buffer cache as in minix (and especially now that the kernel is 
+! compressed :-)
+!
+! The loader has been made as simple as possible, and continuous
+! read errors will result in a unbreakable loop. Reboot by hand. It
+! loads pretty fast by getting whole tracks at a time whenever possible.
+
+//这个程序是linux kernel的第一个程序，包括了linux自己的bootstrap程序
+/*
+定义于include/linux/confug.h:
+#define DEF_INITSEG	0x9000
+#define DEF_SYSSEG	0x1000
+#define DEF_SETUPSEG	0x9020
+#define DEF_SYSSIZE	0x7F00
+*/
+.text
+//读入启动设备中bootsect.s后面的2KB（即4个扇区/boot/setup.s的代码）字节代码到内存0x90200处
+SETUPSECS = 4				! nr of setup-sectors
+//可启动设备上的零道零扇区读入内存中的0x07C00处
+BOOTSEG   = 0x07C0			! original address of boot-sector
+INITSEG   = DEF_INITSEG			! we move boot here - out of the way! 将bootsect程序移到这个段处(0x9000) - 避开; 
+SETUPSEG  = DEF_SETUPSEG		! setup starts here ! 设置程序(setup)从这里开始(段地址0x9020)
+//
+SYSSEG    = DEF_SYSSEG			! system loaded at 0x10000 (65536,64K).
+
+! ROOT_DEV & SWAP_DEV are now written by "build".
+ROOT_DEV = 0
+SWAP_DEV = 0
+#ifndef SVGA_MODE
+#define SVGA_MODE ASK_VGA
+#endif
+#ifndef RAMDISK
+#define RAMDISK 0
+#endif 
+#ifndef CONFIG_ROOT_RDONLY
+#define CONFIG_ROOT_RDONLY 0
+#endif
+
+！串寻址方式：
+！源操作数用寄存器SI寻址，默认在数据段DS中，但允许段超越：DS:[SI]
+！目的操作数用寄存器DI寻址，默认在附加段ES中，不允许段超越：ES:[DI]
+！每执行一次串操作指令，SI和DI将自动增（减）
+！REP重复前缀指令
+！REP :每执行一次串指令，CX减1,直到CX＝0，重复执行结束
+
+! ld86 requires an entry symbol. This may as well be the usual one.
+.globl	_main
+_main:
+#if 0 /* hook for debugger, harmless unless BIOS is fussy (old HP) */
+	int	3
+#endif
+	mov	ax,#BOOTSEG	
+	mov	ds,ax		!将ds段寄存器设置为0x07C0
+	mov	ax,#INITSEG
+	mov	es,ax		！将es段寄存器设置为0x9000
+	mov	cx,#256	！复制的字数
+	sub	si,si		！复制的源地址 ds：si = 0x07C00，从这里开始的512字节是由bios读入的bootsect.s程序
+	sub	di,di		！复制的目的地址 es：di = 0x90000	bootsect.s将自己从0x07C00（31KB）移动到0x90000（576KB）处
+	cld
+	rep				！重复执行下一条指令，并递减cx的值，直到cx为0
+	movsw			！表示将源地址内存处的数据复制cx=256个字到目的地址处
+	jmpi	go,INITSEG		！段间跳转（jump intersegment）。这里的INITSEG指出跳转到的段地址，标号go是段内偏移地址
+	！表示将跳到CS为0x9000，IP为offset"go"的位置(CS:IP=0x9000:offsetgo)，其中
+	！INITSEC=0x9000定义于程序开头的部份，而go这个label则恰好是下一行指令所在的位置 
+! ax and es already contain INITSEG
+！从这里开始，CPU在已经移动到INITSEG位置处的代码中执行
+go:	mov	di,#0x4000-12	! 0x4000 is arbitrary value >= length of
+				! bootsect + length of setup + room for stack
+				! 12 is disk parm size
+
+//旧版本的内核中对堆栈的定义由0xff00改为了0x4000
+! bde - changed 0xff00 to 0x4000 to use debugger at 0x6400 up (bde).  We
+! wouldn't have to worry about this if we checked the top of memory.  Also
+! my BIOS can be configured to put the wini drive tables in high memory
+! instead of in the vector table.  The old stack might have clobbered the
+! drive table.
+	//将其它段寄存器包括DS，ES，SS都指向0x9000这个位置，与CS看齐
+	//因为涉及到堆栈的操作，所以需要设置ss和sp。因为bootsect.s被移动到0x9000，并且其本身占512字节，
+	//其又将setup.s程序（4*512字节）加载到其后，所以sp的值只要不小于512+512*4+堆栈大小就可以了
+	//旧版本的内核将sp的值设置为了0xff00,上面的英文注释中有提到
+	//实际上，BIOS将引导程序加载到0x07C00并将控制权交给引导程序的时候，ss=0x00,sp=0xfffe
+	mov	ds,ax
+	mov	ss,ax		! put stack at INITSEG:0x4000-12.
+	mov	sp,di
+/*
+ *	Many BIOS's default disk parameter tables will not 
+ *	recognize multi-sector reads beyond the maximum sector number
+ *	specified in the default diskette parameter tables - this may
+ *	mean 7 sectors in some cases.
+ *
+ *	Since single sector reads are slow and out of the question,
+ *	we must take care of this by creating new parameter tables
+ *	(for the first disk) in RAM.  We will set the maximum sector
+ *	count to 36 - the most we will encounter on an ED 2.88.  
+ *
+ *	High doesn't hurt.  Low does.
+ *
+ *	Segments are as follows: ds=es=ss=cs - INITSEG,
+ *		fs = 0, gs is unused.
+ */
+//上面这几段话的意思是说，许多BIOS提供的默认的磁盘参数表不能识别超过默认
+//的磁盘参数表指定的扇区数的多扇区读写，而单扇区的读取方式是很慢和会出现
+//问题的，所以需要我们创建新的磁盘参数表，以支持多扇区读写，通常是32个扇区
+//out of the question：出了问题，不值得讨论
+
+/*
+	简单地介绍一下BIOS的中断服务: 80x86将内存最低的256*4bytes保留给256个
+	中断向量(每个interrupt vector大小为4bytes， 所以一共有256*4=1024
+	bytes)，而其中的第1Eh个向量指向"磁盘参数表"，这个表会告诉 电脑如何去
+	读取磁盘机，而我们所要做的事是搬移磁盘参数表到某个内存地址
+
+	此段程序是将FS:BX调整成0000:0078，接着再将DS:SI的内容设成与FS:BX相同，
+	此 处0x78h即为int1Eh的起始位置(7*16+8=120,(1*16+14)*4=120)。调整ES:DI
+	为刚才所设 定的任意地址，从DS:SI搬移6个word(即12byte)到ES:DI所指的位
+	置，显然磁盘参数表的 长度就是6个word，(不过事实上，磁盘参数表的确实长度
+	是11个byte)。关于磁盘参数表， 有兴趣的读者可自行参阅讲述BIOSinterruptservices的技术手册
+
+	在程序中我们所更动的是第五个byte(byte04h)，改为36，这 个byte的功能是定
+	义磁轨上一个磁区的资料笔数。关键的程序码如下:
+	movb 4(di),*36
+*/
+
+! cx contains 0 from rep movsw above
+
+	mov	fs,cx
+	mov	bx,#0x78		! fs:bx is parameter table address
+	push	ds
+	seg fs
+	lds	si,(bx)			! ds:si is source
+
+	mov	cl,#6			! copy 12 bytes
+	cld
+	push	di
+
+	rep
+	movsw		//di在上面已被设置为指向栈顶的位置，即INITSEG:0x4000-12
+	//First 12 bytes of disk parameter have been copied to INITSEG:3FF4.
+	pop	di
+	pop	ds
+
+	movb	4(di),*36		! patch sector count
+
+	//用修改后的磁盘参数表的地址覆盖旧的磁盘参数表的地址
+	//因为每个中断向量占4个字节，第2个字节应该是段内偏移地址
+	//高2个字节是段地址
+	seg fs
+	mov	(bx),di
+	seg fs
+	mov	2(bx),es
+
+! load the setup-sectors directly after the bootblock.
+! Note that 'es' is already set up.
+! Also cx is 0 from rep movsw above.
+
+！将setup模块的代码读入到引导块后面
+//利用bios中断INT 0x13 将setup模块从启动介质第二个扇区开始读取到0x90200处
+//，共读四个扇区，如果出错则CF标志置位，ah中是出错码
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+!!INT 13 - DISK - READ SECTOR(S) INTO MEMORY
+!! AH = 02h
+!! AL = number of sectors to read (must be nonzero)
+!! CH = low eight bits of cylinder number
+!! CL = sector number 1-63 (bits 0-5)
+!! high two bits of cylinder (bits 6-7, hard disk only)
+!! DH = head number
+!! DL = drive number (bit 7 set for hard disk)
+!! ES:BX -> data buffer
+!! Return: CF set on error
+!! if AH = 11h (corrected ECC error), AL = burst length
+!! CF clear if successful
+!! AH = status (see #00234)
+!! AL = number of sectors transferred (only valid if CF set for some
+!! BIOSes)
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! 
+load_setup:
+	xor	ah,ah			! reset FDC 利用BIOS中断服务int13h的第0号功能，重置磁盘控制器
+	xor	dl,dl
+	int 	0x13	
+
+	xor	dx, dx			! drive 0, head 0
+	mov	cl,#0x02		! sector 2, track 0
+	mov	bx,#0x0200		! address = 512, in INITSEG
+	mov	ah,#0x02		! service 2（in ah，read）, nr of sectors（in al）
+	mov	al,setup_sects		! (assume all on head 0, track 0)
+	int	0x13			! read it
+	jnc	ok_load_setup		! ok - continue
+
+	push	ax			! dump error code
+	call	print_nl	！打印换行
+	mov	bp, sp			！bp将作为调用print_hex的参数入栈
+	call	print_hex
+	pop	ax	
+	
+	jmp	load_setup
+
+ok_load_setup:
+
+! Get disk drive parameters, specifically nr of sectors/track
+
+#if 0
+//利用BIOS中断服务int13h的第8号功 能读取目前磁盘机的参数
+!!!!!!!!!!!!!!!!!!!!!!!!!!!
+!! INT 13 - DISK - GET DRIVE PARAMETERS (PC,XT286,CONV,PS,ESDI,SCSI)
+!! AH = 08h
+!! DL = drive (bit 7 set for hard disk)
+!!Return: CF set on error
+!! AH = status (07h) (see #00234)
+!! CF clear if successful
+!! AH = 00h
+!! AL = 00h on at least some BIOSes
+!! BL = drive type (AT/PS2 floppies only) (see #00242)
+!! CH = low eight bits of maximum cylinder number
+!! CL = maximum sector number (bits 5-0)
+!! high two bits of maximum cylinder number (bits 7-6)
+!! DH = maximum head number
+!! DL = number of drives
+!! ESI ->; drive parameter table (floppies only)
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+! bde - the Phoenix BIOS manual says function 0x08 only works for fixed
+! disks.  It doesn't work for one of my BIOS's (1987 Award).  It was
+! fatal not to check the error code.
+
+	xor	dl,dl
+	mov	ah,#0x08		! AH=8 is get drive parameters
+	int	0x13
+	xor	ch,ch
+#else
+
+! It seems that there is no BIOS call to get the number of sectors.  Guess
+! 36 sectors if sector 36 can be read, 18 sectors if sector 18 can be read,
+! 15 if sector 15 can be read.  Otherwise guess 9.
+
+//这段程序用于试探检测磁盘每磁道包含的扇区数，而不是每次能读取的扇区数
+
+	//相当于一个数组首地址，里面存有要逐个试探的扇区数
+	mov	si,#disksizes		! table of sizes to try
+
+probe_loop:
+	//汇编语言中，串操作指令LODSB/LODSW是块读出指令，其具体操作是把SI指向的存储单元读入
+	//累加器,其中LODSB是读入AL,LODSW是读入AX中,然后SI自动增加或减小1或2位.当方向标志位
+	//DF=0时，则SI自动增加；DF=1时，SI自动减小
+	lodsb			！ds:si所指的字节 =>;al, si=si+1
+	//在8086中CBW指令将AL的最高有效位D7扩展至AH，即：如果AL的最高有效位是0，则AH = 00；
+	//AL的最高有效位为1，则AH = FFH。AL不变。
+	cbw				! extend to word
+	mov	sectors, ax
+	cmp	si,#disksizes+4
+	jae	got_sectors		! if all else fails, try 9
+	xchg	ax, cx			! cx = track and sector
+	xor	dx, dx			! drive 0, head 0
+	xor	bl, bl
+	mov	bh,setup_sects
+	inc	bh
+	shl	bh,#1			! address after setup (es = cs)
+	mov	ax,#0x0201		! service 2, 1 sector
+	int	0x13
+	jc	probe_loop		! try next value
+
+#endif
+
+got_sectors:
+
+! Restore es
+
+	mov	ax,#INITSEG
+	mov	es,ax
+/*
+	再来，就要读入真正linux的kernel了，也就是你可以在linux的根目录下看到的 vmlinuz。
+	在读入前，将会先呼叫BIOS中断服务int10h的第3号功能，读取游标位置，之 后再呼叫BIOS中
+	断服务int10h的第13h号功能，在萤幕上输出字符串"Loading"，这个字 符串在boot linux
+	时都会首先被看到，相信大家应该觉得很眼熟吧。
+*/
+! Print some inane（空洞的，无意义的） message
+
+	//首先读取光标位置
+	mov	ah,#0x03		! read cursor pos
+	xor	bh,bh			//返回值位于dx中，dh=行（0-24），dl=列（0--79）
+	int	0x10
+	
+	mov	cx,#9
+	mov	bx,#0x0007		! page 0, attribute 7 (normal)
+	mov	bp,#msg1		！打印的文本字符串“Loading”
+	mov	ax,#0x1301		! write string, move cursor
+	int	0x10
+
+! ok, we've written the message, now
+! we want to load the system (at 0x10000)
+
+//SYSSEG于程序开头时定义为0x1000，先将ES内容设为0x1000，接着在read_it这  
+//个子程序便以ES为目的地的节地址，将kernel读入内存中
+/*
+	《Linux内核源代码情景分析》中提到，对于大内核和小内核两种镜像的不同处理：
+	小内核即内核镜像小于508KB大小的内核，其可以加载进基本内存为内核预留的空间
+	即0x10000--0x90000=8*64K=512K，又因为为内核参数留下了4K空间，所以内核
+	镜像空间只有508K。而内存开始处的64K空间是保留给BIOS和内核运行用的。而
+	0x90000-0xA0000这64K的空间是留给bootsec.S和setup.S模块使用的，因为
+	bootsect只占用一块扇区，所以setup模块理论上可达63.5K。另外，0xA0000即
+	640K以上的空间都用于图形接口卡以及BIOS本身，而0xA0000以下的内存是系统的
+	基本内存。如果配置了1MB以上的内存，则称为高内存。
+	而对于大内核而言，因为基本内存中放不下，所以将其置于0x100000即1MB开始的内
+	存处，但不管是大内核还是小内核，解压缩后都置于0x100000即1MB处。
+	但貌似1.2内核还不存在大内核的情况，而且最终也是通过arch/i386/boot/compressed/head.S
+	程序将压缩的内核模块置于0x100000（1M）处的
+*/
+	mov	ax,#SYSSEG	//SYSSEG=0x1000 即将system模块读入到0x10000即64K开始处。实模式下只能操作1MB的 内存地址
+	mov	es,ax		! segment of 0x010000
+	call	read_it
+//kill_motor子程序，它的功能在于停止软盘机的马达
+	call	kill_motor
+	call	print_nl
+/*
+	从硬盘启动的基本流程：系统上电自检后，由BIOS读取可启动硬盘的第１个扇区（MBR－Master Boot Record）
+	到内存0x7c00处并执行。该程序首先把自身下移到0x600处，并根据MBR中分区表信息指明的活动分区中的第１个扇
+	区（引导扇区）加载到内存0x7c00处并执行。
+
+	目前的2.6内核版本的Linux从硬盘设备引导启动系统的话，需要使用系统引导程序加载内核文件，系统引导程序比如
+	Grub、LILO、Shoelace等（嵌入式环境中的U-boot，bootloader，RedBoot等）。其完成的任务类似于
+	bootsect，如果使用以上系统引导程序的话，bootsect就不会再被运行。
+
+	如果从硬盘启动系统，那么内核映像文件Image会存放在活动分区的根文件系统中。因此需要知道映像文件Image
+	处于文件系统中的位置以及判断是什么文件系统，即引导程序需要能够识别并访问文件系统，并从中读取内核映像。
+
+	所以如果需要从硬盘启动，必须把内核引导程序Grub等放在MBR中，这样系统启动时由BIOS读取MBR后就把控制权交给了Grub。
+*/
+! After that we check which root-device to use. If the device is
+! defined (!= 0), nothing is done and the given device is used.
+! Otherwise, one of /dev/fd0H2880 (2,32) or /dev/PS0 (2,28) or /dev/at0 (2,8),
+! depending on the number of sectors we pretend to know we have.
+
+	seg cs
+	mov	ax,root_dev	//取508,509字节处的根设备号并判断是否已经被定义
+	or	ax,ax
+	jne	root_defined	//若root_dev不为0,表示根设备号已经被定义
+//否则，根设备号未被定义，需要检测。根据上面检测出来的每磁道扇区数推断根设备类型
+	seg cs
+	mov	bx,sectors
+	mov	ax,#0x0208		! /dev/ps0 - 1.2Mb
+//如果sectors=15,则说明是1.2MB的驱动器
+	cmp	bx,#15
+	je	root_defined
+	mov	al,#0x1c		! /dev/PS0 - 1.44Mb
+//如果sectors=18,则说明是1.4MB的软驱	
+	cmp	bx,#18
+	je	root_defined
+	mov	al,#0x20		! /dev/fd0H2880 - 2.88Mb
+	cmp	bx,#36
+	je	root_defined
+	mov	al,#0			! /dev/fd0 - autodetect
+root_defined:
+	seg cs
+	mov	root_dev,ax	//将检查过的根设备号保存到root_dev中
+
+! after that (everything loaded), we jump to
+! the setup-routine loaded directly after
+! the bootblock:
+	//段间跳转，跳转到0x9020：0000（setup.s程序开始处）去执行
+	jmpi	0,SETUPSEG
+
+! This routine loads the system at address 0x10000, making sure
+! no 64kB boundaries are crossed. We try to load it as fast as
+! possible, loading whole tracks whenever we can.
+!
+! in:	es - starting address segment (normally 0x1000)
+!
+//定义3个变量
+sread:	.word 0			! sectors read of current track  ! 当前磁道已读的扇区数
+head:	.word 0			! current head	 ! 当前磁头
+track:	.word 0			! current track	! 当前磁道
+
+read_it:
+	mov	al,setup_sects
+	inc	al
+	mov	sread,al	！当前sread=5=1个bootsect+4个setup
+	mov ax,es
+	test ax,#0x0fff
+die:	jne die			! es must be at 64kB boundary
+	xor bx,bx		! bx is starting address within segment
+rp_read:
+	mov ax,es	! es=0x1000
+	sub ax,#SYSSEG	! 当前es段值减system加载时的启始段值(0x1000)，得到已经加载的数据量
+	cmp ax,syssize		! have we loaded all yet?
+	jbe ok1_read
+	ret
+//根据当前磁道还未读取的扇区数以及段内数据字节开始偏移位置，计算如果全部读取这些未读扇区，
+//所需读取的总字节数是否会超过64KB段长度的限制。若会超过，则根据此次最多能读入的字节数
+//（64KB-段内偏移量bx），反算出此次需要读取的扇区数
+ok1_read:
+	mov ax,sectors  //sectors--每磁道扇区数
+	sub ax,sread   //计算和验证当前磁道需要读取的扇区数，放在ax寄存器中
+	mov cx,ax
+	shl cx,#9
+	add cx,bx    //cx=cx*512+当前段内偏移量bx=此次读操作后，段内共读入的字节数
+	jnc ok2_read	//JNC （Jump if Not Carry ）如果进位位(CF)为0，则转移
+	je ok2_read	//若没有超过64KB的限制，则跳到ok2_read处执行
+	//若加上此次将读磁道上所有的未读扇区时会超过64KB，则计算此时最多能读入的字节数
+	//即64KB-当前段内偏移量，再转换成需读取的扇区数。其中0-某数就是取该数的补值
+	xor ax,ax
+	sub ax,bx
+	shr ax,#9	//根据此次最多能读入的字节数（64KB-段内偏移量bx），反算出此次需要读取的扇区数
+//读当前磁道上指定开始的扇区数al的到es：bx中开始处，然后统计当前磁道上已经读取的扇区数并与最大扇
+//区数做比较，如果小于sectors说明当前磁道上还有扇区未读，于是跳到ok3_read处继续操作。
+ok2_read:
+	call read_track	//读取当前磁道上指定开始扇区和需读取扇区的数据
+	mov cx,ax			//cx=该次操作已读取的扇区数
+	add ax,sread		//加上当前磁道上已读取的扇区数
+	cmp ax,sectors	//如果当前磁道上还有扇区未读，则跳转到ok3_read处
+	jne ok3_read
+	//若该磁道的当前磁头面所有扇区已读取，则取该磁道的下一磁头面（1号磁头）上的数据，若已经完成，则去读下一磁道
+	mov ax,#1
+	sub ax,head	//判断当前磁头号
+	jne ok4_read	//如果是0磁头，则再去读1磁头上的扇区数据
+	inc track	//否则去读下一磁道
+ok4_read:
+	mov head,ax	//保存当前磁头号
+	xor ax,ax		//清当前磁道已读扇区数
+//如果当前磁道还有未读扇区，则首先保存当前磁道已读扇区，然后调整存放数据处的开始位置，若小于64K边界，则跳到rp_read处继续读取数据
+ok3_read:
+	mov sread,ax	//保存当前磁道已读扇区数
+	shl cx,#9		//上次已读扇区数*512字节
+	add bx,cx		//调整当前段内数据开始位置
+	jnc rp_read
+	//否则说明已经读取64K数据，此时调整当前段，为读下一段数据做准备
+	mov ax,es
+	add ah,#0x10	//将段基地址调整为指向下一个64K内存开始处
+	mov es,ax
+	xor bx,bx		//清空段内数据开始偏移值
+	jmp rp_read	//跳转到re_read处继续读取数据
+//读取当前磁道上指定开始扇区和需读扇区数的数据到目的地址处 al中存放需读扇区数
+read_track:
+	pusha
+	pusha	
+	mov	ax, #0xe2e 	! loading... message 2e = .
+	mov	bx, #7
+ 	int	0x10
+	popa		
+
+	mov	dx,track	//取当前磁道号
+	mov	cx,sread	//取当前磁道上已读扇区数
+	inc	cx			//cl：开始读扇区数
+	mov	ch,dl		//ch：当前磁道号
+	mov	dx,head	//取当前磁头号
+	mov	dh,dl		//dh：磁头号
+	and	dx,#0x0100	//dl：驱动器号（为0表示当前A驱动器）
+	mov	ah,#2		//ah=2,读磁盘扇区功能号
+	
+	push	dx				! save for error dump
+	push	cx
+	push	bx
+	push	ax
+
+	int	0x13
+	jc	bad_rt		//若出错
+	add	sp, #8
+	popa
+	ret
+
+bad_rt:	push	ax				! save error code
+	call	print_all			! ah = error, al = read
+	
+	
+	xor ah,ah
+	xor dl,dl
+	int 0x13	//复位磁盘驱动器
+	
+
+	add	sp, #10
+	popa	
+	jmp read_track
+
+/*
+ *	print_all is for debugging purposes.  
+ *	It will print out all of the registers.  The assumption is that this is
+ *	called from a routine, with a stack frame like
+ *	dx 
+ *	cx
+ *	bx
+ *	ax
+ *	error
+ *	ret <- sp
+ *
+*/
+ 
+print_all:
+	mov	cx, #5		! error code + 4 registers
+	mov	bp, sp	
+
+print_loop:
+	push	cx		! save count left
+	call	print_nl	! nl for readability
+
+	cmp	cl, #5
+	jae	no_reg		! see if register name is needed
+	
+	mov	ax, #0xe05 + 'A - 1
+	sub	al, cl
+	int	0x10
+
+	mov	al, #'X
+	int	0x10
+
+	mov	al, #':
+	int	0x10
+
+no_reg:
+	add	bp, #2		! next register
+	call	print_hex	! print it
+	pop	cx
+	loop	print_loop
+	ret
+
+print_nl:
+	mov	ax, #0xe0d	! CR
+	int	0x10
+	mov	al, #0xa	! LF
+	int 	0x10
+	ret
+
+/*
+ *	print_hex is for debugging purposes, and prints the word
+ *	pointed to by ss:bp in hexadecimal.
+*/
+
+print_hex:
+	mov	cx, #4		! 4 hex digits
+	mov	dx, (bp)	! load word into dx
+print_digit:
+	rol	dx, #4		! rotate so that lowest 4 bits are used
+	mov	ax, #0xe0f	! ah = request, al = mask for nybble
+	and	al, dl
+	add	al, #0x90	! convert al to ascii hex (four instructions)
+	daa
+	adc	al, #0x40
+	daa
+	int	0x10
+	loop	print_digit
+	ret
+
+
+/*
+ * This procedure turns off the floppy drive motor, so
+ * that we enter the kernel in a known state, and
+ * don't have to worry about it later.
+ */
+/*
+	首先利用DX指定要输出的port，而03f2这个port则是代表了软盘控制器(floppydis  
+	kcontroller)的所在，再利用outb将资料送出，而我们送出的资料，当然就是归零过的  
+	AL了。如此一来，软盘的马达就停止了。
+*/
+kill_motor:
+	push dx
+	mov dx,#0x3f2
+	xor al, al
+	outb
+	pop dx
+	ret
+
+sectors:
+	.word 0
+
+disksizes:
+	.byte 36,18,15,9
+
+msg1:
+	.byte 13,10	//回车，换行的ascii码
+	.ascii "Loading"
+
+.org 497		//表示下面的语句从地址497处开始
+setup_sects:
+	.byte SETUPSECS
+root_flags:
+	.word CONFIG_ROOT_RDONLY
+syssize:
+	.word SYSSIZE
+swap_dev:
+	.word SWAP_DEV
+ram_size:
+	.word RAMDISK
+vid_mode:
+	.word SVGA_MODE
+root_dev:		//这里存放根文件系统所在设备号
+	.word ROOT_DEV
+//下面是启动盘具有有效引导扇区的标志，仅供bios中的加载引导扇区时识别使用，它必须位于引导扇区的最后两个字节中
+boot_flag:
+	.word 0xAA55

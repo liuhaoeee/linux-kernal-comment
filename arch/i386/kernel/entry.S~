@@ -1,0 +1,637 @@
+/*
+ *  linux/arch/i386/entry.S
+ *
+ *  Copyright (C) 1991, 1992  Linus Torvalds
+ */
+
+/*
+ * entry.S contains the system-call and fault low-level handling routines.
+ * This also contains the timer-interrupt handler, as well as all interrupts
+ * and faults that can result in a task-switch.
+ *
+ * NOTE: This code handles signal-recognition, which happens every time
+ * after a timer-interrupt and after each system call.
+ *
+ * I changed all the .align's to 4 (16 byte alignment), as that's faster
+ * on a 486.
+ *
+ * Stack layout in 'ret_from_system_call':
+ * 	ptrace needs to have all regs on the stack.
+ *	if the order here is changed, it needs to be 
+ *	updated in fork.c:copy_process, signal.c:do_signal,
+ *	ptrace.c and ptrace.h
+ *
+ *	 0(%esp) - %ebx
+ *	 4(%esp) - %ecx
+ *	 8(%esp) - %edx
+ *       C(%esp) - %esi
+ *	10(%esp) - %edi
+ *	14(%esp) - %ebp
+ *	18(%esp) - %eax
+ *	1C(%esp) - %ds
+ *	20(%esp) - %es
+ *      24(%esp) - %fs
+ *	28(%esp) - %gs
+ *	2C(%esp) - orig_eax
+ *	30(%esp) - %eip
+ *	34(%esp) - %cs
+ *	38(%esp) - %eflags
+ *	3C(%esp) - %oldesp
+ *	40(%esp) - %oldss
+ */
+
+#include <linux/sys.h>
+#include <asm/segment.h>
+
+EBX		= 0x00
+ECX		= 0x04
+EDX		= 0x08
+ESI		= 0x0C
+EDI		= 0x10
+EBP		= 0x14
+EAX		= 0x18
+DS		= 0x1C
+ES		= 0x20
+FS		= 0x24
+GS		= 0x28
+ORIG_EAX	= 0x2C
+EIP		= 0x30
+CS		= 0x34
+EFLAGS		= 0x38
+OLDESP		= 0x3C
+OLDSS		= 0x40
+
+CF_MASK		= 0x00000001
+IF_MASK		= 0x00000200
+NT_MASK		= 0x00004000
+VM_MASK		= 0x00020000
+
+/*
+ * these are offsets into the task-struct.
+ */
+state		=  0
+counter		=  4
+priority	=  8
+signal		= 12
+blocked		= 16
+flags		= 20
+errno		= 24
+dbgreg6		= 52
+dbgreg7		= 56
+exec_domain	= 60
+
+
+//本文件即0.11版本的asm.S文件，与tracs.c文件共同组成linux的硬件中断处理程序
+/*
+	entry.S主要用于实现大部分硬件异常所引起的中断的汇编语言处理过程。而tracs.c
+	程序则实现了entry.S的中断处理过程中调用的C函数。
+	entry.S代码文件，主要涉及对Intel保留中断int0--int16共17个
+*/
+
+ENOSYS = 38
+
+.globl _system_call,_lcall7
+.globl _device_not_available, _coprocessor_error
+.globl _divide_error,_debug,_nmi,_int3,_overflow,_bounds,_invalid_op
+.globl _double_fault,_coprocessor_segment_overrun
+.globl _invalid_TSS,_segment_not_present,_stack_segment
+.globl _general_protection,_reserved
+.globl _alignment_check,_page_fault
+.globl ret_from_sys_call, _sys_call_table
+
+/*
+	在调用系统调用前和调用后执行态完全不相同：前者是在用户栈上执行用户态程序，
+	后者在核心栈上执行核心态代码。那么，为了保证在核心内部执行完系统调用后能够
+	返回调用点继续执行用户代码，必须在进入核心态时保存时往核心中压入一个上下文层；
+	在从核心返回时会弹出一个上下文层，这样用户进程就可以继续运行。
+	那么，这些上下文信息是怎样被保存的，被保存的又是那些上下文信息呢？这里仍以x86为例说明。
+	在执行INT指令时，实际完成了以下几条操作：
+	1.由于INT指令发生了不同优先级之间的控制转移，所以首先从TSS（任务状态段）中获取高优先级的核心堆栈信息（SS和ESP）；
+	2.把低优先级堆栈信息（SS和ESP）保留到高优先级堆栈（即核心栈）中； 
+	3.把EFLAGS，外层CS，EIP推入高优先级堆栈（核心栈）中。 
+	4.通过IDT加载CS，EIP（控制转移至中断处理函数）
+	然后就进入了中断0×80的处理函数system_call了，在该函数中首先使用了一个宏SAVE_ALL
+*/
+
+/*
+	定义 SAVE_ALL 是将参数压到堆栈中，然后通过堆栈来进行参数的传递
+	将寄存器中的参数压入到核心栈中（这样内核才能使用用户传入的参数）
+	因为在不同的特权级之间控制转换时，INT指令不同于call指令，它不
+	会将外层堆栈的参数自动拷贝到内核堆栈中所以系统调用时，必须把参
+	数指定到各个寄存器中
+*/
+/*
+	将寄存器的值压入堆栈当中，压入堆栈的顺序对应着结构体struct pt_regs
+	（由于是从用户态陷入到内核态的，所以及其自动保存和转换堆栈，将结构体
+	中的用户ss、esp、eflags、cs、eip自动入栈），当出栈的时候，就将这
+	些值传递到结构体struct pt_regs里面的成员，从而实现从汇编代码向C
+	程序传递参数。
+
+	普通C函数的参数传递是通过把参数值写入堆栈(用户态堆栈或内核态堆栈)来实现的。
+	但因为系统调用是一种特殊函数，它由用户态进入了内核态，所以既不能使用用户态的堆栈
+	也不能直接使用内核态堆栈，而是通过寄存器传值的方法
+	在int $0x80汇编指令之前，系统调用的参数被写入CPU的寄存器。然后，
+	在进入内核态调用系统调用服务例程之前，内核再把存放在CPU寄存器中
+	的参数拷贝到内核态堆栈中。因为毕竟服务例程是C函数，它还是要到堆栈中去寻找参数的
+
+	为什么内核不直接把参数从用户态的栈拷贝到内核态的栈呢？首先，同时操作两个栈是比较复杂的，
+	其次，寄存器的使用使得系统调用处理程序的结构与其他异常处理成的结构类似。
+*/
+#define SAVE_ALL \
+	cld; \
+	push %gs; \
+	push %fs; \
+	push %es; \
+	push %ds; \
+	pushl %eax; \
+	pushl %ebp; \
+	pushl %edi; \
+	pushl %esi; \
+	pushl %edx; \
+	pushl %ecx; \
+	pushl %ebx; \
+	movl $(KERNEL_DS),%edx; \
+	mov %dx,%ds; \
+	mov %dx,%es; \
+	movl $(USER_DS),%edx; \
+	mov %dx,%fs;
+
+#define RESTORE_ALL \
+	cmpw $(KERNEL_CS),CS(%esp); \
+	je 1f;   \
+	movl _current,%eax; \
+	movl dbgreg7(%eax),%ebx; \
+	movl %ebx,%db7;	\
+1:	popl %ebx; \
+	popl %ecx; \
+	popl %edx; \
+	popl %esi; \
+	popl %edi; \
+	popl %ebp; \
+	popl %eax; \
+	pop %ds; \
+	pop %es; \
+	pop %fs; \
+	pop %gs; \
+	addl $4,%esp; \
+	iret	//此指令弹出保存在堆栈中的用户ss、esp、eflags、cs、eip，并返回用户态中
+
+.align 4
+_lcall7:
+	pushfl			# We get a different stack layout with call gates,
+	pushl %eax		# which has to be cleaned up later..
+	SAVE_ALL
+	movl EIP(%esp),%eax	# due to call gates, this is eflags, not eip..
+	movl CS(%esp),%edx	# this is eip..
+	movl EFLAGS(%esp),%ecx	# and this is cs..
+	movl %eax,EFLAGS(%esp)	#
+	movl %edx,EIP(%esp)	# Now we move them to their "normal" places
+	movl %ecx,CS(%esp)	#
+	movl %esp,%eax
+	movl _current,%edx
+	pushl %eax
+	movl exec_domain(%edx),%edx	# Get the execution domain
+	movl 4(%edx),%edx	# Get the lcall7 handler for the domain
+	call *%edx
+	popl %eax
+	jmp ret_from_sys_call
+
+.align 4
+handle_bottom_half:
+	pushfl
+	incl _intr_count
+	sti
+	call _do_bottom_half
+	popfl
+	decl _intr_count
+	jmp 9f
+.align 4
+reschedule:
+	pushl $ret_from_sys_call
+	jmp _schedule
+.align 4
+_system_call:
+	pushl %eax			# save orig_eax	保存EAX寄存器，因为在SAVE_ALL中保存的EAX寄存器会被调用的返回值所覆盖
+	SAVE_ALL			#调用SAVE_ALL保存寄存器上下文
+	movl $-ENOSYS,EAX(%esp)
+	cmpl $(NR_syscalls),%eax	#判断当前调用是否是合法系统调用（EAX是系统调用号，它应该小于NR_syscalls）
+	jae ret_from_sys_call
+	movl _sys_call_table(,%eax,4),%eax
+	testl %eax,%eax
+	je ret_from_sys_call
+	movl _current,%ebx
+	andl $~CF_MASK,EFLAGS(%esp)	# clear carry - assume no errors
+	movl $0,errno(%ebx)
+	movl %db6,%edx
+	movl %edx,dbgreg6(%ebx)  # save current hardware debugging status
+	testb $0x20,flags(%ebx)		# PF_TRACESYS
+	jne 1f
+	call *%eax
+	movl %eax,EAX(%esp)		# save the return value
+	movl errno(%ebx),%edx
+	negl %edx
+	je ret_from_sys_call
+	movl %edx,EAX(%esp)
+	orl $(CF_MASK),EFLAGS(%esp)	# set carry to indicate error
+	jmp ret_from_sys_call
+.align 4
+1:	call _syscall_trace
+	movl ORIG_EAX(%esp),%eax
+	call _sys_call_table(,%eax,4)
+	movl %eax,EAX(%esp)		# save the return value
+	movl _current,%eax
+	movl errno(%eax),%edx
+	negl %edx
+	je 1f
+	movl %edx,EAX(%esp)
+	orl $(CF_MASK),EFLAGS(%esp)	# set carry to indicate error
+1:	call _syscall_trace
+
+/*
+	调用返回的过程要做的工作比其响应过程要多一些，这些工作几乎是每次从核心态返回用户态都需要做的，这里将简要的说明：    
+	1.判断有没有软中断，如果有则跳转到软中断处理； 
+	2.判断当前进程是否需要重新调度，如果需要则跳转到调度处理； 
+	3.如果当前进程有挂起的信号还没有处理，则跳转到信号处理； 
+	4.使用用RESTORE_ALL来弹出所有被SAVE_ALL压入核心栈的内容并且使用iret返回用户态。
+
+	另一个与任务队列有关的概念是中断时间。在Linux中，中断时间是个软件上的概念，取决于内核的全局变量intr_count。
+	任一时候该变量都记录了正在执行的中断处理程序被嵌套的层数*。
+	一般的计算流程中，当处理器允许某个进程时，intr_count值为0。当intr_count不为零时，执行的代码就与系统的其他
+	部分是异步的了。这些异步代码可以是硬件中断的处理或者是“软件中断”－与任何进程都无关的一个任务，
+	我们称它在“中断时间内”运行。这种异步代码是不允许做某些操作的；特别的，它不能使当前进程进入睡眠，
+	因为current指针的值与正在运行的软件中断代码无关。
+	典型的例子是退出系统调用时要执行的代码。如果因为某个原因此时还有任务需要得到执行，内核可以一退出
+	系统调用就处理它。这是个“软件中断”，intr_count值在处理这个待执行的任务之前会先加1。由于主线指令流被中断了，
+	该函数算是在“中断时间”内被处理的。
+	当intr_count非零时，不能激活调度器。（参加sched.c中的调度函数）这也就意味着不允许调用kmalloc(GFP_KERNEL)。在中断时间内，
+	只能进行原子性的分配，而原子性的分配较“普通的”分配更容易失败。
+
+	ret_from_sys_call，它是从中断、异常及系统调用返回时的通用接口。这段代码主体就是ret_from_sys_call函数，在此我们列出相关的几个函数：
+	（1）ret_from_sys_call：主体
+	（2）reschedule：检测是否需要重新调度
+	（3）signal_return：处理当前进程接收到的信号
+	（4）v86_signal_return：处理虚拟86模式下当前进程接收到的信号
+	（5）RESTORE_ALL：我们把这个函数叫做彻底返回函数，因为执行该函数之后，就返回到当前进程的地址空间中去了。
+	可以看到ret_from_sys_call的主要作用有：
+	检测调度标志need_resched，决定是否要执行调度程序；处理当前进程的信号；恢复当前进程的环境使之继续执行。
+*/
+.align 4,0x90
+ret_from_sys_call:
+	cmpl $0,_intr_count
+	jne 2f
+9:	movl _bh_mask,%eax	#bh--bottom handler?
+	andl _bh_active,%eax
+	jne handle_bottom_half
+	movl EFLAGS(%esp),%eax		# check VM86 flag: CS/SS are
+	testl $(VM_MASK),%eax		# different then
+	jne 1f
+	//如果不是用户任务（即是管态、内核态，说明本次系统调用的调用者不是用户任务），直接退出，即不进行信号处理
+	//这是因为任务在内核态执行时不可抢占，否则对任务进行信号量的识别处理
+	cmpw $(KERNEL_CS),CS(%esp)	# was old code segment supervisor ? 
+	je 2f
+1:	sti
+	orl $(IF_MASK),%eax		# these just try to make sure
+	andl $~NT_MASK,%eax		# the program doesn't do anything
+	movl %eax,EFLAGS(%esp)		# stupid
+	cmpl $0,_need_resched
+	jne reschedule
+	movl _current,%eax
+	cmpl _task,%eax			# task[0] cannot have signals	task[0]也不进行信号处理，直接退出
+	je 2f
+	cmpl $0,state(%eax)		# state
+	jne reschedule
+	cmpl $0,counter(%eax)		# counter
+	je reschedule
+	movl blocked(%eax),%ecx
+	movl %ecx,%ebx			# save blocked in %ebx for signal handling
+	notl %ecx	#取反
+	andl signal(%eax),%ecx
+	jne signal_return	#转入信号处理程序
+2:	RESTORE_ALL	  #恢复中断现场，彻底从中断返回
+.align 4
+signal_return:
+	movl %esp,%ecx
+	pushl %ecx	;esp压栈 参数regs
+	testl $(VM_MASK),EFLAGS(%ecx)
+	jne v86_signal_return
+	pushl %ebx	#current->blocked压栈 参数oldmask
+	call _do_signal	#do_signal(unsigned long oldmask, struct pt_regs * regs)
+	popl %ebx	
+	popl %ebx	#入栈的两个参数出栈
+	RESTORE_ALL
+.align 4
+v86_signal_return:
+	call _save_v86_state
+	movl %eax,%esp
+	pushl %eax
+	pushl %ebx
+	call _do_signal
+	popl %ebx
+	popl %ebx
+	RESTORE_ALL
+
+//int0 处理被零除错误
+.align 4
+_divide_error:
+	pushl $0		# no error code
+	pushl $_do_divide_error
+.align 4,0x90
+error_code:
+	push %fs
+	push %es
+	push %ds
+	pushl %eax
+	pushl %ebp
+	pushl %edi
+	pushl %esi
+	pushl %edx
+	pushl %ecx
+	pushl %ebx
+	movl $0,%eax
+	movl %eax,%db7			# disable hardware debugging...
+	cld
+	movl $-1, %eax
+	xchgl %eax, ORIG_EAX(%esp)	# orig_eax (get the error code. )
+	xorl %ebx,%ebx			# zero ebx
+	mov %gs,%bx			# get the lower order bits of gs
+	xchgl %ebx, GS(%esp)		# get the address and save gs.
+	pushl %eax			# push the error code
+	lea 4(%esp),%edx
+	pushl %edx
+	movl $(KERNEL_DS),%edx
+	mov %dx,%ds
+	mov %dx,%es
+	movl $(USER_DS),%edx
+	mov %dx,%fs
+	pushl %eax
+	movl _current,%eax
+	movl %db6,%edx
+	movl %edx,dbgreg6(%eax)  # save current hardware debugging status
+	popl %eax
+	call *%ebx
+	addl $8,%esp
+	jmp ret_from_sys_call
+
+//int16 协处理器错误
+.align 4
+_coprocessor_error:
+	pushl $0
+	pushl $_do_coprocessor_error
+	jmp error_code
+
+//int7 设备不存在
+.align 4
+_device_not_available:
+	pushl $-1		# mark this as an int
+	SAVE_ALL
+	pushl $ret_from_sys_call
+	movl %cr0,%eax
+	testl $0x4,%eax			# EM (math emulation bit)
+	je _math_state_restore
+	pushl $0		# temporary storage for ORIG_EIP
+	call _math_emulate
+	addl $4,%esp
+	ret
+
+//int1 debug调试中断入口
+.align 4
+_debug:
+	pushl $0
+	pushl $_do_debug
+	jmp error_code
+
+//int2 非屏蔽中断调用入口
+.align 4
+_nmi:
+	pushl $0
+	pushl $_do_nmi
+	jmp error_code
+
+//int3 断点指引起的中断入口
+.align 4
+_int3:
+	pushl $0
+	pushl $_do_int3
+	jmp error_code
+
+//int4 溢出错误处理中段入口
+.align 4
+_overflow:
+	pushl $0
+	pushl $_do_overflow
+	jmp error_code
+
+//边界检查处理错误中断入口
+.align 4
+_bounds:
+	pushl $0
+	pushl $_do_bounds
+	jmp error_code
+
+//int6 无效操作指令出错中断入口点
+.align 4
+_invalid_op:
+	pushl $0
+	pushl $_do_invalid_op
+	jmp error_code
+
+//int9 协处理器段超出出错中断入口
+.align 4
+_coprocessor_segment_overrun:
+	pushl $0
+	pushl $_do_coprocessor_segment_overrun
+	jmp error_code
+
+//int15 其他intel保留中断的入口点
+.align 4
+_reserved:
+	pushl $0
+	pushl $_do_reserved
+	jmp error_code
+
+//int8 双出错故障
+.align 4
+_double_fault:
+	pushl $_do_double_fault
+	jmp error_code
+
+//int10 无效的任务状态段
+.align 4
+_invalid_TSS:
+	pushl $_do_invalid_TSS
+	jmp error_code
+
+//int11 段不存在
+.align 4
+_segment_not_present:
+	pushl $_do_segment_not_present
+	jmp error_code
+
+//int12 堆栈段错误
+.align 4
+_stack_segment:
+	pushl $_do_stack_segment
+	jmp error_code
+
+//int13 一般保护性出错
+.align 4
+_general_protection:
+	pushl $_do_general_protection
+	jmp error_code
+
+.align 4
+_alignment_check:
+	pushl $_do_alignment_check
+	jmp error_code
+
+//int14 页错误
+.align 4
+_page_fault:
+	pushl $_do_page_fault
+	jmp error_code
+
+.data
+.align 4
+_sys_call_table:
+	.long _sys_setup		/* 0 */
+	.long _sys_exit
+	.long _sys_fork
+	.long _sys_read
+	.long _sys_write
+	.long _sys_open			/* 5 */
+	.long _sys_close
+	.long _sys_waitpid
+	.long _sys_creat
+	.long _sys_link
+	.long _sys_unlink		/* 10 */
+	.long _sys_execve
+	.long _sys_chdir
+	.long _sys_time
+	.long _sys_mknod
+	.long _sys_chmod		/* 15 */
+	.long _sys_chown
+	.long _sys_break
+	.long _sys_stat
+	.long _sys_lseek
+	.long _sys_getpid		/* 20 */
+	.long _sys_mount
+	.long _sys_umount
+	.long _sys_setuid
+	.long _sys_getuid
+	.long _sys_stime		/* 25 */
+	.long _sys_ptrace
+	.long _sys_alarm
+	.long _sys_fstat
+	.long _sys_pause
+	.long _sys_utime		/* 30 */
+	.long _sys_stty
+	.long _sys_gtty
+	.long _sys_access
+	.long _sys_nice
+	.long _sys_ftime		/* 35 */
+	.long _sys_sync
+	.long _sys_kill
+	.long _sys_rename
+	.long _sys_mkdir
+	.long _sys_rmdir		/* 40 */
+	.long _sys_dup
+	.long _sys_pipe
+	.long _sys_times
+	.long _sys_prof
+	.long _sys_brk			/* 45 */
+	.long _sys_setgid
+	.long _sys_getgid
+	.long _sys_signal
+	.long _sys_geteuid
+	.long _sys_getegid		/* 50 */
+	.long _sys_acct
+	.long _sys_phys
+	.long _sys_lock
+	.long _sys_ioctl
+	.long _sys_fcntl		/* 55 */
+	.long _sys_mpx
+	.long _sys_setpgid
+	.long _sys_ulimit
+	.long _sys_olduname
+	.long _sys_umask		/* 60 */
+	.long _sys_chroot
+	.long _sys_ustat
+	.long _sys_dup2
+	.long _sys_getppid
+	.long _sys_getpgrp		/* 65 */
+	.long _sys_setsid
+	.long _sys_sigaction
+	.long _sys_sgetmask
+	.long _sys_ssetmask
+	.long _sys_setreuid		/* 70 */
+	.long _sys_setregid
+	.long _sys_sigsuspend
+	.long _sys_sigpending
+	.long _sys_sethostname
+	.long _sys_setrlimit		/* 75 */
+	.long _sys_getrlimit
+	.long _sys_getrusage
+	.long _sys_gettimeofday
+	.long _sys_settimeofday
+	.long _sys_getgroups		/* 80 */
+	.long _sys_setgroups
+	.long _sys_select
+	.long _sys_symlink
+	.long _sys_lstat
+	.long _sys_readlink		/* 85 */
+	.long _sys_uselib
+	.long _sys_swapon
+	.long _sys_reboot
+	.long _sys_readdir
+	.long _sys_mmap			/* 90 */
+	.long _sys_munmap
+	.long _sys_truncate
+	.long _sys_ftruncate
+	.long _sys_fchmod
+	.long _sys_fchown		/* 95 */
+	.long _sys_getpriority
+	.long _sys_setpriority
+	.long _sys_profil
+	.long _sys_statfs
+	.long _sys_fstatfs		/* 100 */
+	.long _sys_ioperm
+	.long _sys_socketcall
+	.long _sys_syslog
+	.long _sys_setitimer
+	.long _sys_getitimer		/* 105 */
+	.long _sys_newstat
+	.long _sys_newlstat
+	.long _sys_newfstat
+	.long _sys_uname
+	.long _sys_iopl			/* 110 */
+	.long _sys_vhangup
+	.long _sys_idle
+	.long _sys_vm86
+	.long _sys_wait4
+	.long _sys_swapoff		/* 115 */
+	.long _sys_sysinfo
+	.long _sys_ipc
+	.long _sys_fsync
+	.long _sys_sigreturn
+	.long _sys_clone		/* 120 */
+	.long _sys_setdomainname
+	.long _sys_newuname
+	.long _sys_modify_ldt
+	.long _sys_adjtimex
+	.long _sys_mprotect		/* 125 */
+	.long _sys_sigprocmask
+	.long _sys_create_module
+	.long _sys_init_module
+	.long _sys_delete_module
+	.long _sys_get_kernel_syms	/* 130 */
+	.long _sys_quotactl
+	.long _sys_getpgid
+	.long _sys_fchdir
+	.long _sys_bdflush
+	.long _sys_sysfs		/* 135 */
+	.long _sys_personality
+	.long 0				/* for afs_syscall */
+	.long _sys_setfsuid
+	.long _sys_setfsgid
+	.long _sys_llseek		/* 140 */
+	.space (NR_syscalls-140)*4
